@@ -1,0 +1,138 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    env:
+      SIGNING_IDENTITY: ${{ secrets.KOJI_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.KOJI_APPLE_ID }}
+      TEAM_ID: ${{ secrets.KOJI_TEAM_ID }}
+      APP_PASSWORD: ${{ secrets.KOJI_APP_PASSWORD }}
+      APPLE_CERTIFICATE_BASE64: ${{ secrets.KOJI_APPLE_CERTIFICATE_P12_BASE64 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.KOJI_APPLE_CERTIFICATE_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate release signing inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ -n "${SIGNING_IDENTITY}" ]] || missing+=("KOJI_SIGNING_IDENTITY")
+          [[ -n "${APPLE_ID}" ]] || missing+=("KOJI_APPLE_ID")
+          [[ -n "${TEAM_ID}" ]] || missing+=("KOJI_TEAM_ID")
+          [[ -n "${APP_PASSWORD}" ]] || missing+=("KOJI_APP_PASSWORD")
+          [[ -n "${APPLE_CERTIFICATE_BASE64}" ]] || missing+=("KOJI_APPLE_CERTIFICATE_P12_BASE64")
+          [[ -n "${APPLE_CERTIFICATE_PASSWORD}" ]] || missing+=("KOJI_APPLE_CERTIFICATE_PASSWORD")
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing required GitHub secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Install Developer ID certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CERT_PATH="${RUNNER_TEMP}/koji-signing.p12"
+          KEYCHAIN_PATH="${RUNNER_TEMP}/koji-signing.keychain-db"
+
+          printf '%s' "${APPLE_CERTIFICATE_BASE64}" | base64 -D -o "${CERT_PATH}"
+
+          security create-keychain -p "${APPLE_CERTIFICATE_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${APPLE_CERTIFICATE_PASSWORD}" "${KEYCHAIN_PATH}"
+          security import "${CERT_PATH}" -k "${KEYCHAIN_PATH}" -P "${APPLE_CERTIFICATE_PASSWORD}" -f pkcs12 -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${APPLE_CERTIFICATE_PASSWORD}" "${KEYCHAIN_PATH}"
+          security list-keychains -d user -s "${KEYCHAIN_PATH}"
+
+      - name: Build (Release)
+        run: swift build -c release
+
+      - name: Generate App Icon
+        run: swift scripts/generate_icon.swift
+
+      - name: Build DMG
+        run: ./scripts/build-dmg.sh --skip-assets
+
+      - name: Notarize DMG
+        env:
+          REQUIRE_NOTARIZATION: "true"
+        run: ./scripts/notarize.sh dist/Koji.dmg
+
+      - name: Verify signed artifacts
+        run: |
+          set -euo pipefail
+          codesign --verify --deep --strict --verbose=2 dist/Koji.app
+          spctl --assess --type execute -vv dist/Koji.app
+          xcrun stapler validate dist/Koji.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koji-dmg
+          if-no-files-found: error
+          path: |
+            build/Koji-*.dmg
+            dist/Koji.dmg
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download DMG artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: koji-dmg
+          path: artifacts
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          NOTES="release_notes.md"
+          : > "$NOTES"
+
+          if [[ -f "CHANGELOG.md" ]]; then
+            awk -v ver="$VERSION" '
+              $0 ~ "^## \\[" ver "\\]" { in_section=1; next }
+              in_section && $0 ~ "^## \\[" { exit }
+              in_section { print }
+            ' CHANGELOG.md > "$NOTES"
+          fi
+
+          if [[ ! -s "$NOTES" ]]; then
+            git fetch --tags --force >/dev/null 2>&1 || true
+            PREV_TAG="$(git tag --list 'v*' --sort=-version:refname | grep -v "^${TAG}$" | head -n 1 || true)"
+
+            if [[ -n "$PREV_TAG" ]]; then
+              git log "${PREV_TAG}..${TAG}" --pretty=format:'- %s (%h)' > "$NOTES"
+            else
+              git log -n 50 --pretty=format:'- %s (%h)' > "$NOTES"
+            fi
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.dmg
+          body_path: release_notes.md

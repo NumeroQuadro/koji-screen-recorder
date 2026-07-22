@@ -1,0 +1,33 @@
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+
+# macOS
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local configuration and signing material
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pem
+secrets/
+credentials/
+*_private_key
+
+# Xcode
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# Distribution artifacts
+dist/
+*.app
+*.dmg
